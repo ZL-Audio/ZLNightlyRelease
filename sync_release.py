@@ -3,9 +3,9 @@ import sys
 import requests
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone # Import necessary modules
 
 # --- Configuration ---
-# Get credentials and repository details from environment variables
 GITHUB_TOKEN = os.getenv("INPUT_GITHUB_TOKEN")
 GITEE_TOKEN = os.getenv("INPUT_GITEE_TOKEN")
 GITEE_OWNER = os.getenv("INPUT_GITEE_OWNER")
@@ -17,7 +17,11 @@ GITHUB_REPO = os.getenv("GITHUB_REPOSITORY")
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
 GITEE_API_URL = f"https://gitee.com/api/v5/repos/{GITEE_OWNER}/{GITEE_REPO}"
 
+
 # --- Helper Functions ---
+# (All helper functions: run_command, sync_code_and_tags, get_github_releases, 
+# get_gitee_releases, delete_gitee_release, create_gitee_release, 
+# and upload_gitee_asset remain unchanged.)
 
 def run_command(command):
     """Runs a shell command, logs output, and raises an exception on failure."""
@@ -33,7 +37,6 @@ def run_command(command):
 
 def sync_code_and_tags():
     """Configures git and force-pushes all branches and tags to Gitee."""
-    # (This function remains unchanged)
     print("--- Starting Code and Tag Synchronization ---", flush=True)
     if not GITEE_USERNAME:
         raise ValueError("Error: INPUT_GITEE_USERNAME environment variable is not set. It is required for git push authentication.")
@@ -57,7 +60,6 @@ def sync_code_and_tags():
 
 def get_github_releases():
     """Fetches all releases from the GitHub repository."""
-    # (This function remains unchanged)
     print("Fetching releases from GitHub...")
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     url = f"{GITHUB_API_URL}/releases"
@@ -68,7 +70,6 @@ def get_github_releases():
 
 def get_gitee_releases():
     """Fetches all releases from the Gitee repository."""
-    # (This function remains unchanged)
     print("Fetching releases from Gitee...")
     url = f"{GITEE_API_URL}/releases"
     params = {"access_token": GITEE_TOKEN}
@@ -86,12 +87,10 @@ def delete_gitee_release(release_id):
     if response.status_code == 204:
         print(f"  - Successfully deleted Gitee release ID: {release_id}.")
     else:
-        # Don't fail the whole script, just log the error
         print(f"  - Warning: Could not delete Gitee release ID {release_id}. Status: {response.status_code}, Body: {response.text}", file=sys.stderr)
 
 def create_gitee_release(release_data):
     """Creates a new release on Gitee."""
-    # (This function remains unchanged)
     tag_name = release_data['tag_name']
     print(f"  - Creating Gitee release for tag '{tag_name}'...")
     url = f"{GITEE_API_URL}/releases"
@@ -116,7 +115,6 @@ def create_gitee_release(release_data):
 
 def upload_gitee_asset(gitee_release_id, asset):
     """Downloads an asset from GitHub and uploads it to a Gitee release."""
-    # (This function remains unchanged)
     asset_name = asset['name']
     asset_url = asset['url']
     print(f"    - Handling asset: {asset_name}")
@@ -134,7 +132,8 @@ def upload_gitee_asset(gitee_release_id, asset):
     else:
         print(f"      - Error uploading asset. Status: {upload_response.status_code}, Body: {upload_response.text}", file=sys.stderr)
 
-# --- Main Logic ---
+
+# --- Main Logic (Updated) ---
 
 def main():
     """Main synchronization function."""
@@ -147,33 +146,66 @@ def main():
         # STEP 1: Sync Code and Tags
         sync_code_and_tags()
 
-        # STEP 2: Force Sync Releases
-        print("--- Starting Release Synchronization (Force Mode) ---", flush=True)
+        # STEP 2: Force Sync Recent Releases
+        print("--- Starting Release Synchronization (Recent Releases Only) ---", flush=True)
         github_releases = get_github_releases()
         gitee_releases = get_gitee_releases()
         
-        # Create a map of Gitee tags to their release IDs for easy lookup and deletion
         gitee_release_map = {release['tag_name']: release['id'] for release in gitee_releases}
         print(f"\nFound {len(gitee_release_map)} existing releases on Gitee.")
 
-        # Iterate through all GitHub releases to ensure they are all on Gitee
+        # <<< START: New logic for time filtering >>>
+        # Define the time window: now - 24 hours.
+        # We use timezone-aware datetime objects to avoid comparison issues.
+        # GitHub API uses UTC, so we should too.
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        print(f"Filtering for releases published after: {cutoff_time.isoformat()}")
+
+        recent_releases_found = False
+        # <<< END: New logic for time filtering >>>
+
         for gh_release in reversed(github_releases):
             tag_name = gh_release['tag_name']
-            print(f"\nProcessing GitHub release: '{gh_release['name']}' (tag: {tag_name})")
 
-            # <<-- NEW LOGIC: If a release with the tag exists on Gitee, delete it first -->>
+            # <<< START: New logic for time filtering >>>
+            # Get the 'published_at' timestamp from the GitHub release data.
+            published_at_str = gh_release.get('published_at')
+            if not published_at_str:
+                # Skip drafts or releases without a publication date
+                continue
+
+            # Parse the ISO 8601 date string into a datetime object.
+            # The 'Z' at the end stands for Zulu/UTC. We replace it for compatibility.
+            published_at_dt = datetime.fromisoformat(published_at_str.replace('Z', '+00:00'))
+
+            # Check if the release is within our 24-hour window.
+            if published_at_dt < cutoff_time:
+                print(f"\nSkipping older release: '{gh_release['name']}' (published at {published_at_str})")
+                continue # Move to the next release
+            
+            recent_releases_found = True
+            print(f"\nProcessing recent release: '{gh_release['name']}' (published at {published_at_str})")
+            # <<< END: New logic for time filtering >>>
+
+            # If the release exists on Gitee, delete it first to ensure a clean sync.
             if tag_name in gitee_release_map:
                 release_id_to_delete = gitee_release_map[tag_name]
                 delete_gitee_release(release_id_to_delete)
             
-            # Proceed to create the release, regardless of whether it existed before
+            # Create the new release on Gitee.
             new_gitee_release = create_gitee_release(gh_release)
             
+            # If creation was successful and there are assets, upload them.
             if new_gitee_release and gh_release.get('assets'):
                 gitee_release_id = new_gitee_release['id']
                 print(f"  - Uploading {len(gh_release['assets'])} asset(s)...")
                 for asset in gh_release['assets']:
                     upload_gitee_asset(gitee_release_id, asset)
+        
+        # <<< START: New logic for time filtering >>>
+        if not recent_releases_found:
+            print("\nNo recent releases found to sync in the last 24 hours.")
+        # <<< END: New logic for time filtering >>>
             
         print("\n--- Synchronization Complete ---", flush=True)
 
