@@ -1,0 +1,33 @@
+name: Sync Code and Releases to Gitee
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync-to-gitee:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository with full history
+        uses: actions/checkout@v4
+        with:
+          # This is crucial for fetching all branches and tags
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Sync Script
+        env:
+          INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_GITEE_TOKEN: ${{ secrets.GITEE_PAT }}
+          INPUT_GITEE_USERNAME: ${{ github.actor }}
+          INPUT_GITEE_OWNER: 'ZL-Audio'
+          INPUT_GITEE_REPO: 'ZLNightlyRelease'
+        run: python sync_release.py
