@@ -3,6 +3,13 @@ name: Sync Code and Releases to Gitee
 on:
   workflow_dispatch:
 
+concurrency:
+  group: sync-nightly-releases-to-gitee
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
 jobs:
   sync-to-gitee:
     runs-on: ubuntu-latest

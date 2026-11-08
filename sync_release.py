@@ -3,9 +3,7 @@ import tempfile
 import os
 import sys
 import requests
-import json
 import subprocess
-from datetime import datetime, timedelta, timezone
 
 # --- Configuration ---
 GITHUB_TOKEN = os.getenv("INPUT_GITHUB_TOKEN")
@@ -18,20 +16,30 @@ GITHUB_REPO = os.getenv("GITHUB_REPOSITORY")
 # API endpoints
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
 GITEE_API_URL = f"https://gitee.com/api/v5/repos/{GITEE_OWNER}/{GITEE_REPO}"
+UNSYNCED = "unsynced"
+API_TIMEOUT = (15, 60)
 
 
 # --- Helper Functions ---
 
+def redact(value):
+    text = str(value)
+    for token in (GITHUB_TOKEN, GITEE_TOKEN):
+        if token:
+            text = text.replace(token, "***")
+    return text
+
+
 def run_command(command):
     """Runs a shell command, logs output, and raises an exception on failure."""
-    print(f"Executing: {' '.join(command)}", flush=True)
+    print(f"Executing: {redact(' '.join(command))}", flush=True)
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Error executing command: {' '.join(command)}", file=sys.stderr, flush=True)
-        print(f"STDOUT: {result.stdout}", file=sys.stderr, flush=True)
-        print(f"STDERR: {result.stderr}", file=sys.stderr, flush=True)
+        print(f"Error executing command: {redact(' '.join(command))}", file=sys.stderr, flush=True)
+        print(f"STDOUT: {redact(result.stdout)}", file=sys.stderr, flush=True)
+        print(f"STDERR: {redact(result.stderr)}", file=sys.stderr, flush=True)
         raise subprocess.CalledProcessError(result.returncode, command, output=result.stdout, stderr=result.stderr)
-    print(result.stdout, flush=True)
+    print(redact(result.stdout), flush=True)
     return result
 
 def sync_code_and_tags():
@@ -39,6 +47,8 @@ def sync_code_and_tags():
     print("--- Starting Code and Tag Synchronization ---", flush=True)
     if not GITEE_USERNAME:
         raise ValueError("Error: INPUT_GITEE_USERNAME environment variable is not set. It is required for git push authentication.")
+    # Include tags published after the workflow's initial checkout.
+    run_command(["git", "fetch", "origin", "--tags", "--force"])
     run_command(["git", "config", "--global", "user.name", "GitHub Actions"])
     run_command(["git", "config", "--global", "user.email", "actions@github.com"])
     gitee_repo_url = f"https://{GITEE_USERNAME}:{GITEE_TOKEN}@gitee.com/{GITEE_OWNER}/{GITEE_REPO}.git"
@@ -57,65 +67,117 @@ def sync_code_and_tags():
     print("All tags successfully pushed.", flush=True)
     print("--- Code and Tag Synchronization Complete ---\n", flush=True)
 
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def get_all_pages(url, headers=None, params=None):
+    items = []
+    page = 1
+    while True:
+        page_params = dict(params or {}, per_page=100, page=page)
+        response = requests.get(url, headers=headers, params=page_params, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        batch = response.json()
+        items.extend(batch)
+        if len(batch) < 100:
+            return items
+        page += 1
+
+
 def get_github_releases():
-    """Fetches all releases from the GitHub repository."""
+    """Fetch every release page, including releases older than 24 hours."""
     print("Fetching releases from GitHub...", flush=True)
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    url = f"{GITHUB_API_URL}/releases"
-    response = requests.get(url, headers=headers)
+    return get_all_pages(f"{GITHUB_API_URL}/releases", headers=github_headers())
+
+
+def get_github_release(release_id):
+    """Read a particular build, never a replacement that happens to share its tag."""
+    url = f"{GITHUB_API_URL}/releases/{release_id}"
+    response = requests.get(url, headers=github_headers(), timeout=API_TIMEOUT)
+    if response.status_code == 404:
+        return None
     response.raise_for_status()
-    print("Successfully fetched GitHub releases.", flush=True)
-    return response.json()
+    release = response.json()
+    release["assets"] = get_all_pages(f"{url}/assets", headers=github_headers())
+    return release
+
+
+def is_pending(release):
+    return (not release.get("draft", False)
+            and bool(release.get("published_at"))
+            and release.get("body") == UNSYNCED)
+
+
+def release_fingerprint(release):
+    return (release.get("updated_at"), sorted(
+        (asset["id"], asset["name"], asset["size"], asset.get("updated_at"), asset.get("digest"))
+        for asset in release["assets"]
+    ))
+
+
+def clear_synced_marker(release):
+    release_id = release["id"]
+    current = get_github_release(release_id)
+    if current is None:
+        print("  - Source release was replaced; leaving the new build's marker untouched.", flush=True)
+        return False
+    if not is_pending(current) or release_fingerprint(current) != release_fingerprint(release):
+        print("  - Source release was edited during sync; leaving its body untouched.", flush=True)
+        return False
+    response = requests.patch(
+        f"{GITHUB_API_URL}/releases/{release_id}",
+        headers=github_headers(),
+        json={"body": ""},
+        timeout=API_TIMEOUT,
+    )
+    response.raise_for_status()
+    print(f"  - Cleared unsynced marker for {release['tag_name']}.", flush=True)
+    return True
 
 def get_gitee_releases():
     """Fetches all releases from the Gitee repository."""
     print("Fetching releases from Gitee...", flush=True)
-    url = f"{GITEE_API_URL}/releases"
-    params = {"access_token": GITEE_TOKEN}
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    print("Successfully fetched Gitee releases.", flush=True)
-    return response.json()
+    return get_all_pages(f"{GITEE_API_URL}/releases", params={"access_token": GITEE_TOKEN})
 
 def delete_gitee_release(release_id):
     """Deletes an existing release on Gitee by its ID."""
     print(f"  - Deleting existing Gitee release with ID: {release_id}...", flush=True)
     url = f"{GITEE_API_URL}/releases/{release_id}"
     params = {"access_token": GITEE_TOKEN}
-    response = requests.delete(url, params=params)
-    if response.status_code == 204:
-        print(f"  - Successfully deleted Gitee release ID: {release_id}.", flush=True)
-    else:
-        print(f"  - Warning: Could not delete Gitee release ID {release_id}. Status: {response.status_code}, Body: {response.text}", file=sys.stderr, flush=True)
+    response = requests.delete(url, params=params, timeout=API_TIMEOUT)
+    response.raise_for_status()
+    print(f"  - Successfully deleted Gitee release ID: {release_id}.", flush=True)
 
 def create_gitee_release(release_data):
     """Creates a new release on Gitee."""
     tag_name = release_data['tag_name']
     print(f"  - Creating Gitee release for tag '{tag_name}'...", flush=True)
     url = f"{GITEE_API_URL}/releases"
-    if release_data['name'] is None:
-        release_data['name'] = tag_name
     payload = {
         "access_token": GITEE_TOKEN,
         "tag_name": tag_name,
-        "name": release_data['name'],
-        "body": release_data['body'] or f"Release for {tag_name}",
+        "name": release_data.get('name') or tag_name,
+        "body": f"Release for {tag_name}",
         "prerelease": release_data['prerelease'],
         "target_commitish": release_data['target_commitish']
     }
-    print(payload, flush=True)
-    response = requests.post(url, json=payload)
-    if response.status_code == 201:
-        print(f"  - Successfully created Gitee release '{release_data['name']}'.", flush=True)
-        return response.json()
-    else:
-        print(f"  - Error creating Gitee release. Status: {response.status_code}, Body: {response.text}", file=sys.stderr, flush=True)
-        return None
+    response = requests.post(url, json=payload, timeout=API_TIMEOUT)
+    response.raise_for_status()
+    if response.status_code != 201:
+        raise RuntimeError(f"Unexpected status creating Gitee release: {response.status_code}")
+    print(f"  - Successfully created Gitee release '{payload['name']}'.", flush=True)
+    return response.json()
 
 def upload_gitee_asset(gitee_release_id, asset):
     """Downloads an asset from GitHub (Fail Fast) and uploads it to Gitee (With Retries)."""
     asset_name = asset['name']
     asset_url = asset['url']
+    if os.path.basename(asset_name) != asset_name:
+        raise ValueError(f"Invalid asset filename: {asset_name}")
     
     print(f"    - Handling asset: {asset_name}", flush=True)
     
@@ -125,23 +187,18 @@ def upload_gitee_asset(gitee_release_id, asset):
         print(f"      - Downloading {asset_name} from GitHub to local disk...", flush=True)
         download_headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/octet-stream"}
         
-        with requests.get(asset_url, headers=download_headers, stream=True) as download_response:
+        with requests.get(asset_url, headers=download_headers, stream=True, timeout=(15, 120)) as download_response:
             download_response.raise_for_status()
             with open(local_file_path, 'wb') as f:
                 for chunk in download_response.iter_content(chunk_size=8192):
                     f.write(chunk)
-        print(f"      - Download complete.", flush=True)
+        if os.path.getsize(local_file_path) != asset['size']:
+            raise RuntimeError(f"Downloaded size does not match GitHub asset: {asset_name}")
+        print("      - Download complete.", flush=True)
 
         print(f"      - Uploading {asset_name} to Gitee...", flush=True)
         upload_url = f"{GITEE_API_URL}/releases/{gitee_release_id}/attach_files"
-        params = {"access_token": GITEE_TOKEN}
-        
-        upload_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        
         UPLOAD_RETRIES = 10
-        UPLOAD_TIMEOUT = 600
         
         CONNECT_TIMEOUT = "15"
         MAX_TIME = "1200"
@@ -191,77 +248,65 @@ def upload_gitee_asset(gitee_release_id, asset):
 
 # --- Main Logic ---
 
+def sync_release(release, gitee_release_map):
+    # The listing can become stale while earlier releases are being transferred.
+    release = get_github_release(release["id"])
+    if release is None or not is_pending(release):
+        print("Skipping a release that was replaced or is no longer marked unsynced.", flush=True)
+        return
+
+    tag_name = release["tag_name"]
+    assets = release["assets"]
+    if (not assets or len({asset["name"] for asset in assets}) != len(assets)
+            or any(asset["state"] != "uploaded" or asset["size"] <= 0 for asset in assets)):
+        raise ValueError(f"Release {tag_name} has missing, duplicate, or incomplete assets.")
+
+    print(f"\nProcessing unsynced release: {tag_name}", flush=True)
+    if tag_name in gitee_release_map:
+        delete_gitee_release(gitee_release_map[tag_name])
+    new_gitee_release = create_gitee_release(release)
+    gitee_release_id = new_gitee_release["id"]
+    gitee_release_map[tag_name] = gitee_release_id
+    print(f"  - Uploading {len(assets)} asset(s)...", flush=True)
+    for asset in assets:
+        upload_gitee_asset(gitee_release_id, asset)
+
+    # An exception at any earlier step leaves the marker available for a retry.
+    clear_synced_marker(release)
+
+
 def main():
     """Main synchronization function."""
     try:
         # Validate that all required environment variables are set
         if not all([GITHUB_TOKEN, GITEE_TOKEN, GITEE_OWNER, GITEE_REPO, GITEE_USERNAME, GITHUB_REPO]):
-            print("Error: One or more required environment variables are not set.", file=sys.stderr, flush=True)
-            sys.exit(1)
+            raise ValueError("One or more required environment variables are not set.")
 
-        # STEP 1: Sync Code and Tags
+        pending_releases = [release for release in get_github_releases() if is_pending(release)]
+        if not pending_releases:
+            print("No published releases have a body exactly equal to 'unsynced'.", flush=True)
+            return 0
+
+        # Mirror code and tags once, then acknowledge each release independently.
         sync_code_and_tags()
-
-        # STEP 2: Force Sync Recent Releases
-        print("--- Starting Release Synchronization (Recent Releases Only) ---", flush=True)
-        github_releases = get_github_releases()
         gitee_releases = get_gitee_releases()
-        
         gitee_release_map = {release['tag_name']: release['id'] for release in gitee_releases}
-        print(f"\nFound {len(gitee_release_map)} existing releases on Gitee.", flush=True)
+        failures = []
+        for release in reversed(pending_releases):
+            try:
+                sync_release(release, gitee_release_map)
+            except Exception as error:
+                failures.append(release["tag_name"])
+                print(f"Sync failed for {release['tag_name']}: {redact(error)}", file=sys.stderr, flush=True)
 
-        # Define the time window: now - 24 hours.
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
-        print(f"Filtering for releases published after: {cutoff_time.isoformat()}", flush=True)
-
-        recent_releases_found = False
-
-        for gh_release in reversed(github_releases):
-            tag_name = gh_release['tag_name']
-
-            # Get the 'published_at' timestamp from the GitHub release data.
-            published_at_str = gh_release.get('published_at')
-            if not published_at_str:
-                # Skip drafts or releases without a publication date
-                continue
-
-            # Parse the ISO 8601 date string into a datetime object.
-            published_at_dt = datetime.fromisoformat(published_at_str.replace('Z', '+00:00'))
-
-            # Check if the release is within our 24-hour window.
-            if published_at_dt < cutoff_time:
-                print(f"\nSkipping older release: '{gh_release['name']}' (published at {published_at_str})", flush=True)
-                continue # Move to the next release
-            
-            recent_releases_found = True
-            print(f"\nProcessing recent release: '{gh_release['name']}' (published at {published_at_str})", flush=True)
-
-            # If the release exists on Gitee, delete it first to ensure a clean sync.
-            if tag_name in gitee_release_map:
-                release_id_to_delete = gitee_release_map[tag_name]
-                delete_gitee_release(release_id_to_delete)
-            
-            # Create the new release on Gitee.
-            new_gitee_release = create_gitee_release(gh_release)
-            
-            # If creation was successful and there are assets, upload them.
-            if new_gitee_release and gh_release.get('assets'):
-                gitee_release_id = new_gitee_release['id']
-                print(f"  - Uploading {len(gh_release['assets'])} asset(s)...", flush=True)
-                for asset in gh_release['assets']:
-                    upload_gitee_asset(gitee_release_id, asset)
-        
-        if not recent_releases_found:
-            print("\nNo recent releases found to sync in the last 24 hours.", flush=True)
-            
+        if failures:
+            print(f"Failed releases remain pending: {', '.join(failures)}", file=sys.stderr, flush=True)
+            return 1
         print("\n--- Synchronization Complete ---", flush=True)
-
-    except (requests.exceptions.RequestException, subprocess.CalledProcessError, ValueError) as e:
-        print(f"\nAn error occurred: {e}", file=sys.stderr, flush=True)
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}", file=sys.stderr, flush=True)
-        sys.exit(1)
+        return 0
+    except Exception as error:
+        print(f"\nSynchronization failed: {redact(error)}", file=sys.stderr, flush=True)
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
